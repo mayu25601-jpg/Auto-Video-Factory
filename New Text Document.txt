@@ -28,12 +28,20 @@ git push origin main
 
 ######################################################################
 
+git folder regenerate
+
+rm -rf .git
+
+git init
+
+git branch -M main
+
+git remote add origin https://github.com/mayu25601-jpg/Auto-Video-Factory.git
 
 git add .
-git commit -m "Fresh start from laptop"
+
+git commit -m "Fresh start from laptop with clean history"
+
 git push -f origin main
 
-
-
-git reflog expire --expire=now --all
-git gc --prune=now
+######################################################################
