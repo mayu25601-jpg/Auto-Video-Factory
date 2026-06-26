@@ -98,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-v5
+          key: pip-${{ runner.os }}-v6
           restore-keys: |
             pip-${{ runner.os }}-
 
@@ -127,16 +127,22 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           pip install --upgrade pip
-          # Fix 1: numpy<2.0.0 for moviepy 1.0.3 compatibility
+
+          # PyPI မှ package များ install လုပ်မည်
           pip install \
             "numpy<2.0.0" \
-            moviepy==1.0.3 \
+            "moviepy==1.0.3" \
             Pillow \
             openai-whisper \
             playwright \
             pyrogram \
-            tgcrypto \
-            torch --index-url https://download.pytorch.org/whl/cpu
+            tgcrypto
+
+          # PyTorch သီးသန့် install လုပ်မည် (CPU version)
+          pip install \
+            torch \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
 
       - name: Install Playwright and Chromium
         if: steps.check.outputs.skip != 'true'
@@ -208,8 +214,6 @@ jobs:
             echo "Size: ${SIZE_MB}MB | Duration: ${DUR_STR}"
           fi
 
-      # Fix 2: Upload .mp4 directly — no manual zip needed
-      # upload-artifact@v4 compresses automatically
       - name: Upload Video_${{ matrix.folder }}
         if: >
           steps.check.outputs.skip != 'true' &&
@@ -339,9 +343,7 @@ jobs:
           REPO:              ${{ github.repository }}
         run: |
           python - << 'PYEOF'
-          import os
-          import asyncio
-          import sys
+          import os, asyncio, sys
           from pyrogram import Client
 
           API_ID   = os.environ.get("TELEGRAM_API_ID",   "")
@@ -361,12 +363,9 @@ jobs:
               print("Missing secrets — skip")
               sys.exit(0)
 
-          RUN_URL = (
-              f"https://github.com/{REPO}"
-              f"/actions/runs/{RUN_ID}"
-          )
-          emoji  = "✅" if int(SUCCESS) > 0 else "❌"
-          status = "ALL COMPLETE" if int(SUCCESS) > 0 else "NO VIDEOS"
+          RUN_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}"
+          emoji   = "✅" if int(SUCCESS) > 0 else "❌"
+          status  = "ALL COMPLETE" if int(SUCCESS) > 0 else "NO VIDEOS"
 
           msg = (
               f"{emoji} RENDER {status}\n"
@@ -394,10 +393,7 @@ jobs:
                   no_updates     = True,
               )
               async with app:
-                  await app.send_message(
-                      chat_id = chat,
-                      text    = msg,
-                  )
+                  await app.send_message(chat_id=chat, text=msg)
               print("Summary sent!")
 
           try:
@@ -407,8 +403,6 @@ jobs:
               sys.exit(0)
           PYEOF
 
-      # Fix 2: Correct fallback condition
-      # needs.render-video.result covers matrix failures
       - name: Fallback Bot Notify
         if: contains(needs.render-video.result, 'failure')
         env:
