@@ -1,0 +1,425 @@
+name: Video Renderer 20 Parallel
+
+on:
+  workflow_dispatch:
+    inputs:
+      format:
+        description: 'Video Format'
+        required: true
+        default: 'youtube'
+        type: choice
+        options:
+          - youtube
+          - shorts
+          - facebook
+      branding:
+        description: 'Channel Branding'
+        required: true
+        default: 'BRAND_A'
+        type: choice
+        options:
+          - BRAND_A
+          - BRAND_B
+          - none
+      fps:
+        description: 'FPS (24=quality / 20=faster)'
+        required: true
+        default: '24'
+        type: choice
+        options:
+          - '24'
+          - '20'
+      quality:
+        description: 'JPEG Quality (85=default / 75=faster)'
+        required: true
+        default: '85'
+        type: choice
+        options:
+          - '85'
+          - '75'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+
+  render-video:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        folder: ['1','2','3','4','5','6','7','8','9','10',
+                 '11','12','13','14','15','16','17','18','19','20']
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check folder exists
+        id: check
+        run: |
+          FOLDER="videos/${{ matrix.folder }}"
+          if [ ! -d "$FOLDER" ]; then
+            echo "skip=true"             >> $GITHUB_OUTPUT
+            echo "result=SKIP_NO_FOLDER" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          has_mp3=$(find "$FOLDER" -maxdepth 1 \
+            -iname "*.mp3" 2>/dev/null | wc -l)
+          has_img=$(find "$FOLDER" -maxdepth 1 \
+            \( -iname "*.jpg"  \
+            -o -iname "*.jpeg" \
+            -o -iname "*.png"  \
+            -o -iname "*.webp" \) \
+            2>/dev/null | wc -l)
+          if [[ $has_mp3 -eq 0 || $has_img -eq 0 ]]; then
+            echo "skip=true"                 >> $GITHUB_OUTPUT
+            echo "result=SKIP_MISSING_FILES" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false"   >> $GITHUB_OUTPUT
+            echo "result=READY" >> $GITHUB_OUTPUT
+            echo "mp3=$has_mp3 img=$has_img — ready"
+          fi
+
+      - name: Setup Python
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-v5
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Cache Whisper model
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/whisper
+          key: whisper-small-v1
+
+      - name: Cache Playwright browsers
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-v1
+
+      - name: Cache APT packages
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-ffmpeg-v1
+
+      - name: Install Python packages
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          pip install --upgrade pip
+          # Fix 1: numpy<2.0.0 for moviepy 1.0.3 compatibility
+          pip install \
+            "numpy<2.0.0" \
+            moviepy==1.0.3 \
+            Pillow \
+            openai-whisper \
+            playwright \
+            pyrogram \
+            tgcrypto \
+            torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Playwright and Chromium
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Install FFmpeg and Fonts
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-noto-core \
+            fonts-noto-color-emoji \
+            fonts-sil-padauk \
+            fonts-liberation \
+            fontconfig
+          fc-cache -f -v
+
+      - name: Render Folder ${{ matrix.folder }}
+        if: steps.check.outputs.skip != 'true'
+        id: render
+        env:
+          FOLDER_NAME:          ${{ matrix.folder }}
+          VIDEO_FORMAT:         ${{ github.event.inputs.format }}
+          BRANDING_ALIAS:       ${{ github.event.inputs.branding }}
+          FPS_INPUT:            ${{ github.event.inputs.fps }}
+          QUALITY_INPUT:        ${{ github.event.inputs.quality }}
+          SECRET_BRAND_A:       ${{ secrets.MY_BRAND_A }}
+          SECRET_BRAND_A_TYPOS: ${{ secrets.MY_BRAND_A_TYPOS }}
+          SECRET_BRAND_B:       ${{ secrets.MY_BRAND_B }}
+          SECRET_BRAND_B_TYPOS: ${{ secrets.MY_BRAND_B_TYPOS }}
+        run: |
+          for attempt in 1 2; do
+            echo "Attempt ${attempt}/2"
+            if python scripts/render_single.py; then
+              echo "render_status=success" >> $GITHUB_OUTPUT
+              break
+            else
+              if [ $attempt -eq 2 ]; then
+                echo "render_status=failed" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+              echo "Retrying in 5s..."
+              sleep 5
+            fi
+          done
+
+      - name: Get video info
+        if: >
+          steps.check.outputs.skip != 'true' &&
+          steps.render.outputs.render_status == 'success'
+        id: info
+        run: |
+          MP4="output/${{ matrix.folder }}.mp4"
+          if [ -f "$MP4" ]; then
+            SIZE_MB=$(du -m "$MP4" | cut -f1)
+            DURATION=$(ffprobe -v quiet \
+              -show_entries format=duration \
+              -of csv=p=0 "$MP4" 2>/dev/null || echo "0")
+            DURATION=$(printf "%.0f" \
+              "$DURATION" 2>/dev/null || echo "0")
+            MIN=$((DURATION / 60))
+            SEC=$((DURATION % 60))
+            DUR_STR="${MIN}m${SEC}s"
+            echo "size_mb=${SIZE_MB}"  >> $GITHUB_OUTPUT
+            echo "duration=${DUR_STR}" >> $GITHUB_OUTPUT
+            echo "Size: ${SIZE_MB}MB | Duration: ${DUR_STR}"
+          fi
+
+      # Fix 2: Upload .mp4 directly — no manual zip needed
+      # upload-artifact@v4 compresses automatically
+      - name: Upload Video_${{ matrix.folder }}
+        if: >
+          steps.check.outputs.skip != 'true' &&
+          steps.render.outputs.render_status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Video_${{ matrix.folder }}
+          path: output/${{ matrix.folder }}.mp4
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Send to Telegram
+        if: >
+          steps.check.outputs.skip != 'true' &&
+          steps.render.outputs.render_status == 'success'
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOLDER:            ${{ matrix.folder }}
+          FORMAT:            ${{ github.event.inputs.format }}
+          BRANDING:          ${{ github.event.inputs.branding }}
+          DURATION:          ${{ steps.info.outputs.duration }}
+        run: |
+          python scripts/telegram_send.py \
+            "output/${{ matrix.folder }}.mp4" \
+            "${FOLDER}" \
+            "${FORMAT}" \
+            "${BRANDING}" \
+            "${DURATION}"
+
+  collect-results:
+    needs: render-video
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pyrogram
+        run: pip install pyrogram tgcrypto -q
+
+      - name: Download all videos
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Video_*
+          path: all-videos/
+          merge-multiple: true
+
+      - name: Count and summarize
+        id: count
+        run: |
+          success=0
+          names=""
+          total_size=0
+
+          if compgen -G "all-videos/*.mp4" > /dev/null 2>&1; then
+            for f in all-videos/*.mp4; do
+              if [ -f "$f" ]; then
+                success=$((success + 1))
+                name=$(basename "$f" .mp4)
+                names="$names $name"
+                size=$(stat -c%s "$f")
+                total_size=$((total_size + size))
+              fi
+            done
+          fi
+
+          total_mb=$((total_size / 1024 / 1024))
+          echo "success=$success"   >> $GITHUB_OUTPUT
+          echo "names=$names"       >> $GITHUB_OUTPUT
+          echo "total_mb=$total_mb" >> $GITHUB_OUTPUT
+
+          echo "## Render Results"       >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |"         >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|"         >> $GITHUB_STEP_SUMMARY
+
+          if compgen -G "all-videos/*.mp4" > /dev/null 2>&1; then
+            for f in all-videos/*.mp4; do
+              if [ -f "$f" ]; then
+                size=$(du -sh "$f" | cut -f1)
+                name=$(basename "$f")
+                echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total: ${success} videos / ${total_mb}MB**" \
+            >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload ALL-VIDEOS-COMPLETE
+        if: steps.count.outputs.success != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ALL-VIDEOS-COMPLETE
+          path: all-videos/
+          retention-days: 1
+          compression-level: 6
+
+      - name: Final Telegram Summary
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUCCESS:           ${{ steps.count.outputs.success }}
+          NAMES:             ${{ steps.count.outputs.names }}
+          TOTAL_MB:          ${{ steps.count.outputs.total_mb }}
+          FORMAT:            ${{ github.event.inputs.format }}
+          BRANDING:          ${{ github.event.inputs.branding }}
+          FPS:               ${{ github.event.inputs.fps }}
+          RUN_ID:            ${{ github.run_id }}
+          REPO:              ${{ github.repository }}
+        run: |
+          python - << 'PYEOF'
+          import os
+          import asyncio
+          import sys
+          from pyrogram import Client
+
+          API_ID   = os.environ.get("TELEGRAM_API_ID",   "")
+          API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+          SESSION  = os.environ.get("TELEGRAM_SESSION",  "")
+          CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "")
+          SUCCESS  = os.environ.get("SUCCESS",  "0")
+          NAMES    = os.environ.get("NAMES",    "").strip()
+          TOTAL_MB = os.environ.get("TOTAL_MB", "0")
+          FORMAT   = os.environ.get("FORMAT",   "")
+          BRANDING = os.environ.get("BRANDING", "")
+          FPS      = os.environ.get("FPS",      "")
+          RUN_ID   = os.environ.get("RUN_ID",   "")
+          REPO     = os.environ.get("REPO",     "")
+
+          if not all([API_ID, API_HASH, SESSION, CHAT_ID]):
+              print("Missing secrets — skip")
+              sys.exit(0)
+
+          RUN_URL = (
+              f"https://github.com/{REPO}"
+              f"/actions/runs/{RUN_ID}"
+          )
+          emoji  = "✅" if int(SUCCESS) > 0 else "❌"
+          status = "ALL COMPLETE" if int(SUCCESS) > 0 else "NO VIDEOS"
+
+          msg = (
+              f"{emoji} RENDER {status}\n"
+              f"{'='*30}\n"
+              f"Videos  : {SUCCESS}\n"
+              f"Total   : {TOTAL_MB}MB\n"
+              f"Format  : {FORMAT}\n"
+              f"Brand   : {BRANDING}\n"
+              f"FPS     : {FPS}\n"
+              f"IDs     : {NAMES}\n"
+              f"{'='*30}\n"
+              f"{RUN_URL}"
+          )
+
+          async def send():
+              try:
+                  chat = int(CHAT_ID)
+              except ValueError:
+                  chat = CHAT_ID
+              app = Client(
+                  name           = "yt_final",
+                  session_string = SESSION,
+                  api_id         = int(API_ID),
+                  api_hash       = API_HASH,
+                  no_updates     = True,
+              )
+              async with app:
+                  await app.send_message(
+                      chat_id = chat,
+                      text    = msg,
+                  )
+              print("Summary sent!")
+
+          try:
+              asyncio.run(send())
+          except Exception as e:
+              print(f"Summary error: {e}")
+              sys.exit(0)
+          PYEOF
+
+      # Fix 2: Correct fallback condition
+      # needs.render-video.result covers matrix failures
+      - name: Fallback Bot Notify
+        if: contains(needs.render-video.result, 'failure')
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_ID:    ${{ github.run_id }}
+          REPO:      ${{ github.repository }}
+        run: |
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          MSG="Render had failures: ${RUN_URL}"
+          curl -s -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            -d "text=${MSG}" || true

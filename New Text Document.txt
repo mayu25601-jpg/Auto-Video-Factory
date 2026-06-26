@@ -1,0 +1,39 @@
+cd ~/Desktop/Auto-Video-Factory
+git add .
+git commit -m "Upload new video batch for today"
+git push origin main
+
+gh run download <7404906143> -n Video_1
+
+gh run download <ဒီနေရာမှာ_ဂဏန်းအသစ်_ထည့်ပါ> -n ALL-VIDEOS-COMPLETE
+
+gh run download 26933999325 -n ALL-VIDEOS-COMPLETE
+
+
+
+
+
+# ၁။ Project ဖိုဒါထဲကို ဝင်မယ်
+cd ~/Desktop/Auto-Video-Factory
+
+# ၂။ အပြောင်းအလဲအားလုံးကို ရွေးမယ် (ဒီကောင်က ဖျက်လိုက်တဲ့ အဟောင်းတွေကိုရော၊ အသစ်တွေကိုပါ အလိုလို သိပါတယ်)
+git add .
+
+# ၃။ ဒီနေ့အတွက် မှတ်စုလေးရေးမယ်
+git commit -m "Upload new video batch for today"
+
+# ၄။ GitHub ပေါ်ကို တွန်းတင်မယ်
+git push origin main
+
+
+######################################################################
+
+
+git add .
+git commit -m "Fresh start from laptop"
+git push -f origin main
+
+
+
+git reflog expire --expire=now --all
+git gc --prune=now
