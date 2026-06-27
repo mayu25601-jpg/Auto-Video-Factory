@@ -43,7 +43,7 @@ from playwright.sync_api import sync_playwright
 FOLDER_NAME    = os.environ.get('FOLDER_NAME',    '1')
 VIDEO_FORMAT   = os.environ.get('VIDEO_FORMAT',   'youtube')
 BRANDING_ALIAS = os.environ.get('BRANDING_ALIAS', 'none')
-FPS            = int(os.environ.get('FPS_INPUT',     '24'))
+FPS            = int(os.environ.get('FPS_INPUT',     '20'))
 JPEG_QUALITY   = int(os.environ.get('QUALITY_INPUT', '85'))
 MUSIC_VOLUME   = 0.12
 
@@ -362,15 +362,14 @@ try:
                     # so JS applies correct transform without Math.random()
                     move_idx = slide % MOVE_COUNT
                     page.evaluate(f"showSlide({idx}, {move_idx})")
-                    # Small wait on slide change so transform applies
-                    page.wait_for_timeout(16)  # 1 frame at 60fps
 
                 page.evaluate(f"updateTime({t:.4f})")
 
                 for attempt in range(MAX_FRAME_RETRY):
                     try:
                         img_bytes = page.screenshot(
-                            type='png',
+                            type='jpeg',
+                            quality=JPEG_QUALITY,
                             clip={
                                 'x': 0, 'y': 0,
                                 'width':  W,
