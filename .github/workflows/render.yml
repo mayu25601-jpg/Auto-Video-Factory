@@ -127,16 +127,17 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           pip install --upgrade pip
-          # Fix 1: numpy<2.0.0 for moviepy 1.0.3 compatibility
+          # Step 1: Install PyPI packages first (moviepy, whisper, etc.)
           pip install \
             "numpy<2.0.0" \
-            moviepy==1.0.3 \
+            "moviepy==1.0.3" \
             Pillow \
             openai-whisper \
             playwright \
             pyrogram \
-            tgcrypto \
-            torch --index-url https://download.pytorch.org/whl/cpu
+            tgcrypto
+          # Step 2: Install torch separately from PyTorch index
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install Playwright and Chromium
         if: steps.check.outputs.skip != 'true'
