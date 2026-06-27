@@ -3,6 +3,11 @@ git add .
 git commit -m "Upload new video batch for today"
 git push origin main
 
+
+alias pushvideos='cd ~/Desktop/Auto-Video-Factory && git add . && git commit -m "Upload new video batch for today" && git push origin main'
+
+
+
 gh run download <7404906143> -n Video_1
 
 gh run download <ဒီနေရာမှာ_ဂဏန်းအသစ်_ထည့်ပါ> -n ALL-VIDEOS-COMPLETE
