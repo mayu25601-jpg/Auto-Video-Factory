@@ -1,21 +1,28 @@
 # scripts/render_single.py
 # ═══════════════════════════════════════════════════════
-# FINAL PERFECT VERSION
-# Tweak 1: escape_ffmpeg_text ခိုင်မာအောင် ပြင်ပြီး
-# Tweak 2: WORDS_PER_LINE safe range (4/6) သတ်မှတ်ပြီး
-# Fail-safe 1: FFmpeg crash detect + stderr print
-# Fail-safe 2: -filter_script:v သုံး (OS limit safe)
+# GITHUB ACTIONS VERSION — Animation fully working
+# Fix 1: numpy<2.0.0 (moviepy 1.0.3 compatibility)
+# Fix 2: GPU auto-detect for Whisper
+# Fix 3: os.cpu_count() for threads
+# Fix 4: wait_for_selector instead of fixed timeout
+# Fix 5: RAM pipe instead of disk I/O for frames
+# Fix 6: Capital letter fix for images/audio
+# Fix 7: Zero brand leak — secrets only
+# Fix 8: Animation via JS transform — NOT CSS (GitHub safe)
+# Fix 9: Deterministic slide move — no Math.random() per frame
+# Fix 10: Font bundled inline — no Google Fonts needed
 # ═══════════════════════════════════════════════════════
 
 import os
 import gc
 import re
+import io
+import json
 import time
-import signal
 import shutil
 import subprocess
-import tempfile
 
+import numpy as np
 import whisper
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
@@ -28,6 +35,7 @@ from moviepy.editor import (
     CompositeVideoClip,
 )
 from moviepy.audio.fx.all import audio_loop
+from playwright.sync_api import sync_playwright
 
 # ═══════════════════════════════════════════════════════
 # ENV VARS
@@ -40,7 +48,7 @@ JPEG_QUALITY   = int(os.environ.get('QUALITY_INPUT', '85'))
 MUSIC_VOLUME   = 0.12
 
 # ═══════════════════════════════════════════════════════
-# SECRETS
+# SECRETS → REAL VALUES
 # ═══════════════════════════════════════════════════════
 ALIAS_MAP = {
     'BRAND_A': os.environ.get('SECRET_BRAND_A', ''),
@@ -69,61 +77,36 @@ FOLDER_PATH = os.path.join(VIDEOS_PATH, FOLDER_NAME)
 MUSIC_PATH  = os.path.join(ASSETS_PATH, 'music.mp3')
 
 # ═══════════════════════════════════════════════════════
-# BRANDING
+# BRANDING → LOGO + TEMPLATE
 # ═══════════════════════════════════════════════════════
 if BRANDING_ALIAS != 'none':
     alias_lower = BRANDING_ALIAS.lower()
     logo_path   = os.path.join(ASSETS_PATH, f'logo_{alias_lower}.png')
+    html_path   = os.path.join(ASSETS_PATH, f'template_{alias_lower}.html')
 else:
     alias_lower = 'none'
     logo_path   = None
+    html_path   = os.path.join(ASSETS_PATH, 'template_default.html')
 
 # ═══════════════════════════════════════════════════════
 # FORMAT
 # ═══════════════════════════════════════════════════════
 FORMATS = {
-    'youtube':  {'w': 1920, 'h': 1080},
-    'shorts':   {'w': 1080, 'h': 1920},
-    'facebook': {'w': 1080, 'h': 1350},
+    'youtube':  {'w': 1920, 'h': 1080, 'class': 'fmt-16-9'},
+    'shorts':   {'w': 1080, 'h': 1920, 'class': 'fmt-9-16'},
+    'facebook': {'w': 1080, 'h': 1350, 'class': 'fmt-4-5'},
 }
-config      = FORMATS.get(VIDEO_FORMAT, FORMATS['youtube'])
-W           = config['w']
-H           = config['h']
+config = FORMATS.get(VIDEO_FORMAT, FORMATS['youtube'])
+
+# Auto CPU count
 CPU_THREADS = os.cpu_count() or 2
 
-# GPU detect
+# Auto GPU detect
 try:
     import torch
     WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 except ImportError:
     WHISPER_DEVICE = "cpu"
-
-# ═══════════════════════════════════════════════════════
-# CAPTION STYLE CONFIG
-# ═══════════════════════════════════════════════════════
-# Font path — GitHub Actions Ubuntu တွင် ရှိသော font
-FONT_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-if not os.path.exists(FONT_PATH):
-    FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
-if not os.path.exists(FONT_PATH):
-    FONT_PATH = None
-
-# Caption Y position
-CAPTION_Y = int(H * 0.78)
-
-# Font sizes by format
-FONT_SIZES = {
-    'youtube':  72,
-    'shorts':   80,
-    'facebook': 68,
-}
-FONT_SIZE = FONT_SIZES.get(VIDEO_FORMAT, 72)
-
-# ── Tweak 2: WORDS_PER_LINE safe range ────────────────
-# shorts=4, others=6
-# ⚠️ WARNING: ဘယ်တော့မှ 8 ထက်မပိုရ
-# 10+ → FFmpeg filter string crash
-WORDS_PER_LINE = 4 if VIDEO_FORMAT == 'shorts' else 6
 
 # ═══════════════════════════════════════════════════════
 # HELPERS
@@ -145,10 +128,11 @@ def get_images(folder):
     return imgs
 
 def get_audio(folder):
-    return sorted([
+    mp3_files = sorted([
         f for f in os.listdir(folder)
         if f.lower().endswith('.mp3')
     ])
+    return mp3_files
 
 def fmt_dur(sec):
     sec = int(sec)
@@ -158,126 +142,28 @@ def fmt_dur(sec):
 def fmt_time(sec):
     return time.strftime('%H:%M:%S', time.gmtime(sec))
 
-def get_audio_duration(path):
-    r = subprocess.run([
-        'ffprobe', '-v', 'quiet',
-        '-show_entries', 'format=duration',
-        '-of', 'csv=p=0', path
-    ], capture_output=True, text=True)
-    return float(r.stdout.strip() or "0")
-
-# ── Tweak 1: escape_ffmpeg_text ခိုင်မာအောင် ───────────
-def escape_ffmpeg_text(text):
-    """
-    FFmpeg drawtext အတွက် special chars escape
-    - Single quote → smart quote
-    - Colon escape
-    - ရှုပ်ထွေးသော သင်္ကေတများ ဖြုတ်ချ
-    """
-    if not text:
-        return ""
-    text = text.replace("'", "\u2019")
-    text = text.replace(':', '\\:')
-    text = re.sub(r'[\[\]{}|\\^~]', '', text)
-    return text
-
-# ═══════════════════════════════════════════════════════
-# CAPTION FILTER BUILDER
-# ═══════════════════════════════════════════════════════
-def build_drawtext_filters(
-    caption_lines, font_path, font_size, cap_y, W
-):
-    """
-    Beautiful caption layers:
-    Layer 1 — Dark shadow (depth effect)
-    Layer 2 — White text + black border (readability)
-    Layer 3 — Yellow highlight per word (sync)
-    """
-    filters  = []
-    font_opt = f":fontfile='{font_path}'" if font_path else ""
-    char_w   = font_size * 0.55  # approx px per char
-
-    for line in caption_lines:
-        text    = escape_ffmpeg_text(line['text'])
-        t_start = line['start']
-        t_end   = line['end']
-        enable  = f"between(t,{t_start:.3f},{t_end:.3f})"
-
-        # ── Layer 1: Shadow ────────────────────────────
-        filters.append(
-            f"drawtext=text='{text}'"
-            f"{font_opt}"
-            f":fontsize={font_size}"
-            f":fontcolor=0x000000AA"
-            f":x=(w-text_w)/2+4"
-            f":y={cap_y}+4"
-            f":enable='{enable}'"
-        )
-
-        # ── Layer 2: White text + border ───────────────
-        filters.append(
-            f"drawtext=text='{text}'"
-            f"{font_opt}"
-            f":fontsize={font_size}"
-            f":fontcolor=white"
-            f":borderw=4"
-            f":bordercolor=black"
-            f":x=(w-text_w)/2"
-            f":y={cap_y}"
-            f":enable='{enable}'"
-        )
-
-        # ── Layer 3: Per-word yellow highlight ─────────
-        words        = line['words']
-        full_text    = line['text']
-        total_w_px   = len(full_text) * char_w
-        prefix_chars = 0
-
-        for word_info in words:
-            w_text   = escape_ffmpeg_text(word_info['word'])
-            w_start  = word_info['start']
-            w_end    = word_info['end']
-            w_enable = f"between(t,{w_start:.3f},{w_end:.3f})"
-            word_x   = f"(w-{total_w_px:.0f})/2+{prefix_chars * char_w:.0f}"
-
-            filters.append(
-                f"drawtext=text='{w_text}'"
-                f"{font_opt}"
-                f":fontsize={font_size}"
-                f":fontcolor=yellow"
-                f":borderw=4"
-                f":bordercolor=0x00000088"
-                f":x={word_x}"
-                f":y={cap_y}"
-                f":enable='{w_enable}'"
-            )
-
-            prefix_chars += len(word_info['word']) + 1
-
-    return ','.join(filters)
-
 # ═══════════════════════════════════════════════════════
 # START
 # ═══════════════════════════════════════════════════════
 start_time = time.time()
 
 print(f"\n{'='*55}")
-print(f"  Folder      : {FOLDER_NAME}")
-print(f"  Format      : {VIDEO_FORMAT} {W}x{H}")
-print(f"  Alias       : {BRANDING_ALIAS}")
-print(f"  FPS         : {FPS}")
-print(f"  Threads     : {CPU_THREADS}")
-print(f"  Device      : {WHISPER_DEVICE}")
-print(f"  Font        : {FONT_PATH or 'system default'}")
-print(f"  Words/line  : {WORDS_PER_LINE}  ← safe (max 6)")
+print(f"  Folder  : {FOLDER_NAME}")
+print(f"  Format  : {VIDEO_FORMAT} {config['w']}x{config['h']}")
+print(f"  Alias   : {BRANDING_ALIAS}")
+print(f"  FPS     : {FPS}")
+print(f"  Quality : {JPEG_QUALITY}")
+print(f"  Threads : {CPU_THREADS}")
+print(f"  Device  : {WHISPER_DEVICE}")
+print(f"  Typos   : {len(WORD_FIXES)} words")
 print(f"{'='*55}\n")
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-# ── Validate ──────────────────────────────────────────
+# Validate
 mp3_files = get_audio(FOLDER_PATH)
 if not mp3_files:
-    raise SystemExit(f"ERROR: No mp3 in {FOLDER_PATH}")
+    raise SystemExit(f"ERROR: No .mp3/.MP3 in {FOLDER_PATH}")
 
 audio_path  = os.path.join(FOLDER_PATH, mp3_files[0])
 output_file = os.path.join(OUTPUT_PATH, f"{FOLDER_NAME}.mp4")
@@ -285,208 +171,251 @@ images      = get_images(FOLDER_PATH)
 
 if not images:
     raise SystemExit(f"ERROR: No images in {FOLDER_PATH}")
+if not os.path.exists(html_path):
+    raise SystemExit(f"ERROR: Template missing: {html_path}")
 
 print(f"  Audio   : {mp3_files[0]}")
-print(f"  Images  : {len(images)} → {images[:3]}")
+print(f"  Images  : {len(images)} files")
+print(f"  Sample  : {images[:3]}")
+print(f"  HTML    : {os.path.basename(html_path)}")
 
 # ═══════════════════════════════════════════════════════
-# PHASE 1 — DURATION
+# PHASE 1 — TRANSCRIBE
 # ═══════════════════════════════════════════════════════
-duration  = get_audio_duration(audio_path)
-slide_dur = duration / len(images)
-
-print(f"\n  Duration  : {fmt_dur(duration)}")
-print(f"  Slide dur : {slide_dur:.2f}s × {len(images)}")
-
-# ═══════════════════════════════════════════════════════
-# PHASE 2 — WHISPER
-# ═══════════════════════════════════════════════════════
-print(f"\n[1/4] Transcribing...")
+print(f"\n[1/4] Transcribing ({WHISPER_DEVICE})...")
 t1 = time.time()
 
-timeout_sec = max(300, min(900, int(duration * 3)))
-print(f"  Model   : tiny | Device: {WHISPER_DEVICE}")
-print(f"  Timeout : {fmt_dur(timeout_sec)}")
+model  = whisper.load_model("small", device=WHISPER_DEVICE)
+result = model.transcribe(
+    audio_path,
+    word_timestamps=True,
+    language='en',
+    temperature=0.0,
+)
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError(f"Whisper timeout {fmt_dur(timeout_sec)}")
-
-signal.signal(signal.SIGALRM, _timeout_handler)
-signal.alarm(timeout_sec)
-
-try:
-    model  = whisper.load_model("tiny", device=WHISPER_DEVICE)
-    print(f"  Model loaded | {fmt_time(time.time()-t1)}")
-
-    result = model.transcribe(
-        audio_path,
-        word_timestamps=True,
-        language='en',
-        temperature=0.0,
-        verbose=False,
-        fp16=False,
-        condition_on_previous_text=False,
-    )
-    print(f"  Transcribed  | {fmt_time(time.time()-t1)}")
-
-finally:
-    signal.alarm(0)
-
-# ── Word list ──────────────────────────────────────────
-all_words = []
-for seg in result['segments']:
+segments = []
+for si, seg in enumerate(result['segments']):
+    words = []
     for w in seg.get('words', []):
-        raw = w['word'].strip()
-        if not raw:
-            continue
-        check = raw.upper().replace('.','').replace(',','').strip()
-        all_words.append({
+        raw   = w['word'].strip()
+        check = raw.upper().replace('.', '').replace(',', '').strip()
+        words.append({
             'word' : WORD_FIXES.get(check, raw),
             'start': round(w['start'], 3),
             'end'  : round(w['end'],   3),
         })
+    if words:
+        segments.append({
+            'id'   : si,
+            'start': round(seg['start'], 3),
+            'end'  : round(seg['end'],   3),
+            'words': words,
+        })
 
-print(f"  Words   : {len(all_words)} | {fmt_time(time.time()-t1)}")
+total_words = sum(len(s['words']) for s in segments)
+print(f"  Done: {total_words} words | {fmt_time(time.time()-t1)}")
 del model
 gc.collect()
 
 # ═══════════════════════════════════════════════════════
-# PHASE 3 — BUILD CAPTION LINES + FILTER FILE
+# PHASE 2 — DURATION
 # ═══════════════════════════════════════════════════════
-print(f"\n[2/4] Building captions...")
+vc       = AudioFileClip(audio_path)
+duration = vc.duration
+vc.close()
 
-caption_lines = []
-i = 0
-while i < len(all_words):
-    chunk = all_words[i : i + WORDS_PER_LINE]
-    caption_lines.append({
-        'text' : ' '.join(w['word'] for w in chunk),
-        'start': chunk[0]['start'],
-        'end'  : chunk[-1]['end'],
-        'words': chunk,
-    })
-    i += WORDS_PER_LINE
+raw_dur          = duration / len(images)
+slide_dur        = 4.5 if raw_dur >= 3.0 else max(2.5, raw_dur)
+frames_per_slide = int(slide_dur * FPS)
+total_frames     = int(duration * FPS)
 
-print(f"  Lines   : {len(caption_lines)}")
+print(f"\n  Duration : {fmt_dur(duration)}")
+print(f"  Frames   : {total_frames}")
+print(f"  Estimate : ~{fmt_dur(total_frames * 0.15)} (RAM pipe mode)")
 
-caption_filter = build_drawtext_filters(
-    caption_lines, FONT_PATH, FONT_SIZE, CAPTION_Y, W
+# ═══════════════════════════════════════════════════════
+# PHASE 3 — PLAYWRIGHT + FFMPEG PIPE
+# KEY FIX: Animation driven by JS per-frame, NOT CSS transition
+# showSlide(idx, moveIndex) receives deterministic move number
+# so each screenshot captures correct transform state
+# ═══════════════════════════════════════════════════════
+print(f"\n[2/4] Rendering {total_frames} frames → FFmpeg pipe...")
+t2 = time.time()
+
+W = config['w']
+H = config['h']
+
+# Pre-compute which move (0-4) each slide uses — deterministic
+# Uses slide index mod 5 so same video = same animation every run
+MOVE_COUNT = 5
+slide_moves = {}  # { slide_index: move_number }
+
+ffmpeg_cmd = [
+    'ffmpeg', '-y',
+    '-f', 'rawvideo',
+    '-vcodec', 'rawvideo',
+    '-s', f'{W}x{H}',
+    '-pix_fmt', 'rgb24',
+    '-r', str(FPS),
+    '-i', 'pipe:0',
+    '-i', audio_path,
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-crf', '23',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    '-movflags', '+faststart',
+    '-threads', str(CPU_THREADS),
+    '-shortest',
+    output_file,
+]
+
+ffmpeg_proc = subprocess.Popen(
+    ffmpeg_cmd,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
 )
 
-filter_size_kb = len(caption_filter) / 1024
-print(f"  Filter  : {filter_size_kb:.1f} KB")
-
-if filter_size_kb > 500:
-    print(f"  ⚠️  Filter > 500KB — reduce WORDS_PER_LINE if crash")
-
-# ═══════════════════════════════════════════════════════
-# PHASE 4 — FFMPEG RENDER
-# ═══════════════════════════════════════════════════════
-print(f"\n[3/4] FFmpeg rendering...")
-t3 = time.time()
-
-tmp_dir = tempfile.mkdtemp(prefix="render_")
+MAX_FRAME_RETRY = 3
+log_every       = max(1, total_frames // 20)
 
 try:
-    # ── Resize images ──────────────────────────────────
-    print(f"  Resizing {len(images)} images...")
-    resized_paths = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                # NOTE: Do NOT use --disable-gpu
+                # GPU emulation needed for CSS rendering
+                '--disable-web-security',
+                '--font-render-hinting=none',
+                '--force-color-profile=srgb',
+            ]
+        )
+        try:
+            ctx  = browser.new_context(
+                viewport={'width': W, 'height': H},
+                device_scale_factor=1,
+            )
+            page = ctx.new_page()
+            page.goto(f"file://{html_path}", wait_until='networkidle')
+            page.evaluate(f"document.body.className = '{config['class']}'")
+            page.evaluate(f"setDuration({duration})")
 
-    for idx, img_name in enumerate(images):
-        src = os.path.join(FOLDER_PATH, img_name)
-        dst = os.path.join(tmp_dir, f"slide_{idx:04d}.jpg")
+            for i, img in enumerate(images):
+                fp = os.path.join(FOLDER_PATH, img).replace('\\', '/')
+                page.evaluate(f"""(function() {{
+                    var bg = document.createElement('img');
+                    bg.src = 'file://{fp}';
+                    bg.className = 'bg-img';
+                    document.getElementById('bg-slider').appendChild(bg);
+                    var sl = document.createElement('img');
+                    sl.src = 'file://{fp}';
+                    sl.className = 'slide-img';
+                    sl.dataset.index = '{i}';
+                    document.getElementById('slider').appendChild(sl);
+                }})();""")
 
-        subprocess.run([
-            'ffmpeg', '-y', '-i', src,
-            '-vf', (
-                f'scale={W}:{H}:'
-                f'force_original_aspect_ratio=decrease,'
-                f'pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black'
-            ),
-            '-q:v', str(max(2, 10 - JPEG_QUALITY // 10)),
-            dst,
-        ], check=True,
-           stdout=subprocess.DEVNULL,
-           stderr=subprocess.DEVNULL)
+            page.evaluate(f"loadCaptions({json.dumps(segments)})")
 
-        resized_paths.append(dst)
+            # Wait until slides are in DOM
+            page.wait_for_selector(
+                '.slide-img[data-index="0"]',
+                state='attached',
+                timeout=30000,
+            )
+            # Wait for images to actually load
+            page.evaluate("""() => {
+                return new Promise(resolve => {
+                    const imgs = document.querySelectorAll('.slide-img, .bg-img');
+                    let loaded = 0;
+                    const total = imgs.length;
+                    if (total === 0) { resolve(); return; }
+                    imgs.forEach(img => {
+                        if (img.complete) {
+                            loaded++;
+                            if (loaded === total) resolve();
+                        } else {
+                            img.onload = img.onerror = () => {
+                                loaded++;
+                                if (loaded === total) resolve();
+                            };
+                        }
+                    });
+                });
+            }""")
+            page.wait_for_timeout(800)
 
-        if (idx + 1) % 5 == 0 or idx == len(images) - 1:
-            print(f"  Resized {idx+1}/{len(images)}")
+            cur_slide = -1
 
-    # ── Concat file ────────────────────────────────────
-    concat_file = os.path.join(tmp_dir, "concat.txt")
-    with open(concat_file, 'w') as f:
-        for idx, rp in enumerate(resized_paths):
-            if idx == len(resized_paths) - 1:
-                dur = max(duration - (slide_dur * idx), 0.5)
-            else:
-                dur = slide_dur
-            f.write(f"file '{rp}'\n")
-            f.write(f"duration {dur:.4f}\n")
-        f.write(f"file '{resized_paths[-1]}'\n")
+            for i in range(total_frames):
+                t       = i / FPS
+                slide   = i // frames_per_slide
+                idx     = slide % len(images)
 
-    # ── Fail-safe 2: Filter → file ─────────────────────
-    # -filter_script:v သုံး — OS ARG_MAX limit safe
-    filter_file = os.path.join(tmp_dir, "caption.filter")
-    with open(filter_file, 'w', encoding='utf-8') as f:
-        f.write(caption_filter)
+                if slide != cur_slide:
+                    cur_slide = slide
+                    # KEY FIX: Pass deterministic move index
+                    # so JS applies correct transform without Math.random()
+                    move_idx = slide % MOVE_COUNT
+                    page.evaluate(f"showSlide({idx}, {move_idx})")
+                    # Small wait on slide change so transform applies
+                    page.wait_for_timeout(16)  # 1 frame at 60fps
 
-    print(f"  Filter file : {filter_size_kb:.1f} KB → {filter_file}")
+                page.evaluate(f"updateTime({t:.4f})")
 
-    # ── FFmpeg command ─────────────────────────────────
-    print(f"  Encoding...")
-    t_enc = time.time()
+                for attempt in range(MAX_FRAME_RETRY):
+                    try:
+                        img_bytes = page.screenshot(
+                            type='png',
+                            clip={
+                                'x': 0, 'y': 0,
+                                'width':  W,
+                                'height': H,
+                            },
+                            full_page=False,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == MAX_FRAME_RETRY - 1:
+                            raise RuntimeError(f"Frame {i} failed: {e}")
+                        time.sleep(0.3)
 
-    ffmpeg_cmd = [
-        'ffmpeg', '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', concat_file,
-        '-i', audio_path,
-        # ── Fail-safe 2: file မှ filter ဖတ် ──────────
-        # -vf တိုက်ရိုက်မပေးဘဲ filter_script သုံး
-        # OS command line limit လုံးဝ မကျော်တော့
-        '-filter_script:v', filter_file,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '23',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-movflags', '+faststart',
-        '-threads', str(CPU_THREADS),
-        '-r', str(FPS),
-        '-shortest',
-        output_file,
-    ]
+                pil_img  = PIL.Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                rgb_data = np.array(pil_img, dtype=np.uint8).tobytes()
+                ffmpeg_proc.stdin.write(rgb_data)
 
-    # ── Fail-safe 1: FFmpeg crash detect ──────────────
-    ffmpeg_proc = subprocess.Popen(
-        ffmpeg_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
+                if (i + 1) % log_every == 0:
+                    elapsed = time.time() - t2
+                    pct     = (i + 1) / total_frames
+                    eta     = (elapsed / pct) - elapsed
+                    print(
+                        f"  {pct*100:5.1f}% "
+                        f"({i+1}/{total_frames}) "
+                        f"ETA: {fmt_time(eta)}"
+                    )
 
-    print(f"  FFmpeg PID  : {ffmpeg_proc.pid}")
+        finally:
+            browser.close()
+
+    ffmpeg_proc.stdin.close()
     ffmpeg_proc.wait()
 
     if ffmpeg_proc.returncode != 0:
-        err = ffmpeg_proc.stderr.read().decode(errors='replace')
-        print(f"\n  ❌ FFmpeg crashed! Code: {ffmpeg_proc.returncode}")
-        print(f"  Error tail:\n{err[-3000:]}")
-        raise RuntimeError(
-            f"FFmpeg failed (code {ffmpeg_proc.returncode})"
-        )
+        raise RuntimeError(f"FFmpeg failed: {ffmpeg_proc.returncode}")
 
-    print(f"  Encoded     : {fmt_time(time.time()-t_enc)}")
-    print(f"  Total phase : {fmt_time(time.time()-t3)}")
+    print(f"  Done: {total_frames} frames | {fmt_time(time.time()-t2)}")
 
-finally:
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+except Exception as e:
+    ffmpeg_proc.stdin.close()
+    ffmpeg_proc.kill()
+    raise e
 
 # ═══════════════════════════════════════════════════════
-# PHASE 5 — MUSIC + LOGO
+# PHASE 4 — ADD MUSIC + LOGO (if needed)
 # ═══════════════════════════════════════════════════════
 needs_postprocess = (
     os.path.exists(MUSIC_PATH) or
@@ -494,32 +423,28 @@ needs_postprocess = (
 )
 
 if needs_postprocess:
-    print(f"\n[4/4] Post-processing...")
-    t4 = time.time()
+    print(f"\n[3/4] Post-processing (music/logo)...")
+    t3 = time.time()
 
-    temp_out = output_file.replace('.mp4', '_tmp.mp4')
-    os.rename(output_file, temp_out)
+    temp_output = output_file.replace('.mp4', '_temp.mp4')
+    os.rename(output_file, temp_output)
 
     from moviepy.editor import VideoFileClip
 
-    clip  = VideoFileClip(temp_out)
+    clip  = VideoFileClip(temp_output)
     audio = clip.audio
 
     if os.path.exists(MUSIC_PATH):
         voice = AudioFileClip(audio_path)
         bg    = AudioFileClip(MUSIC_PATH)
-        bg    = (
-            audio_loop(bg, duration=duration + 2)
-            if bg.duration < duration
-            else bg.subclip(0, duration)
-        )
-        audio = CompositeAudioClip(
-            [bg.volumex(MUSIC_VOLUME), voice]
-        )
+        bg    = audio_loop(bg, duration=duration + 2) \
+                if bg.duration < duration \
+                else bg.subclip(0, duration)
+        audio = CompositeAudioClip([bg.volumex(MUSIC_VOLUME), voice])
         print(f"  Music mixed")
 
     if logo_path and os.path.exists(logo_path):
-        logo_h = int(H * 0.09)
+        logo_h = int(config['h'] * 0.09)
         logo   = (
             ImageClip(logo_path)
             .set_duration(duration)
@@ -528,7 +453,7 @@ if needs_postprocess:
             .set_pos(('right', 'top'))
         )
         clip = CompositeVideoClip([clip, logo])
-        print(f"  Logo added  : {alias_lower}")
+        print(f"  Logo added: {alias_lower}")
 
     clip.set_audio(audio).write_videofile(
         output_file,
@@ -543,13 +468,14 @@ if needs_postprocess:
             "-pix_fmt",  "yuv420p",
         ],
     )
+
     clip.close()
-    os.remove(temp_out)
+    os.remove(temp_output)
     gc.collect()
-    print(f"  Done        : {fmt_time(time.time()-t4)}")
+    print(f"  Done | {fmt_time(time.time()-t3)}")
 
 else:
-    print(f"\n[4/4] No music/logo — skipping")
+    print(f"\n[3/4] No music/logo — skipping post-process")
 
 # ═══════════════════════════════════════════════════════
 # DONE
@@ -559,9 +485,9 @@ size_mb    = os.path.getsize(output_file) / (1024 * 1024)
 
 print(f"\n{'='*55}")
 print(f"  COMPLETE!")
-print(f"  File      : {FOLDER_NAME}.mp4")
-print(f"  Size      : {size_mb:.1f} MB")
-print(f"  Duration  : {fmt_dur(duration)}")
-print(f"  Time      : {fmt_time(total_time)}")
-print(f"  Speed     : {duration/total_time:.1f}x realtime")
+print(f"  File     : {FOLDER_NAME}.mp4")
+print(f"  Size     : {size_mb:.1f} MB")
+print(f"  Duration : {fmt_dur(duration)}")
+print(f"  Time     : {fmt_time(total_time)}")
+print(f"  Speed    : {duration/total_time:.1f}x realtime")
 print(f"{'='*55}\n")

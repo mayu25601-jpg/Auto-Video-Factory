@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@900&family=Roboto:wght@700&display=swap');
+        /* Fonts: system fallback — GitHub Actions has no Google Fonts access */
 
         * { box-sizing: border-box; }
         body { margin: 0; overflow: hidden; background: #000; }
@@ -130,7 +130,7 @@
             100% { transform: scale(1);    }
         }
         .social-text {
-            font-family: 'Roboto', sans-serif;
+            font-family: 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif;
             font-weight: 900; color: #000;
             font-size: 26px; text-transform: uppercase;
         }
@@ -160,7 +160,7 @@
         }
 
         .caption-container {
-            font-family: 'Montserrat', sans-serif;
+            font-family: 'Liberation Sans Bold', 'DejaVu Sans Bold', Arial Black, sans-serif;
             font-weight: 900; text-transform: uppercase;
             display: flex; flex-wrap: wrap;
             justify-content: center; align-items: center;
@@ -291,7 +291,7 @@
             el.classList.add('flash-active');
         }
 
-        function showSlide(index) {
+        function showSlide(index, moveIndex) {
             const moves    = ['move-1','move-2','move-3','move-4','move-5'];
             const slides   = document.querySelectorAll('.slide-img');
             const bgSlides = document.querySelectorAll('.bg-img');
@@ -299,7 +299,10 @@
 
             slides.forEach(s => s.classList.remove(...allCls));
             if (slides[index]) {
-                const m = moves[Math.floor(Math.random() * moves.length)];
+                // KEY FIX: Use deterministic moveIndex from Python
+                // No Math.random() — same result every screenshot
+                const safeIdx = (typeof moveIndex === 'number') ? moveIndex % moves.length : 0;
+                const m = moves[safeIdx];
                 slides[index].classList.add('active', m);
                 triggerFlash();
             }
