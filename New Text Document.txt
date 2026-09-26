@@ -1,0 +1,70 @@
+~/Desktop/Auto-Video-Factory/push_today.sh
+
+
+cd ~/Desktop/Auto-Video-Factory
+git add .
+git commit -m "Upload new video batch for today"
+git push origin main
+
+
+
+cd ~/Desktop/Auto-Video-Factory
+git add .github/workflows/render.yml .github/workflows/send_telegram.yml
+git commit -m "Send Telegram videos one by one instead of parallel"
+git push origin main
+
+
+
+Send Artifacts to Telegram	Render ပြီးသား၊ Telegram ပို့တာ fail မှသာ။ run_id မှာ အဲဒီ render run ဂဏန်းထည့်
+
+
+furstlove121@gmail.com
+
+
+
+alias pushvideos='cd ~/Desktop/Auto-Video-Factory && git add . && git commit -m "Upload new video batch for today" && git push origin main'
+
+
+
+gh run download <7404906143> -n Video_1
+
+gh run download <ဒီနေရာမှာ_ဂဏန်းအသစ်_ထည့်ပါ> -n ALL-VIDEOS-COMPLETE
+
+gh run download 26933999325 -n ALL-VIDEOS-COMPLETE
+
+
+
+
+
+# ၁။ Project ဖိုဒါထဲကို ဝင်မယ်
+cd ~/Desktop/Auto-Video-Factory
+
+# ၂။ အပြောင်းအလဲအားလုံးကို ရွေးမယ် (ဒီကောင်က ဖျက်လိုက်တဲ့ အဟောင်းတွေကိုရော၊ အသစ်တွေကိုပါ အလိုလို သိပါတယ်)
+git add .
+
+# ၃။ ဒီနေ့အတွက် မှတ်စုလေးရေးမယ်
+git commit -m "Upload new video batch for today"
+
+# ၄။ GitHub ပေါ်ကို တွန်းတင်မယ်
+git push origin main
+
+
+######################################################################
+
+git folder regenerate
+
+rm -rf .git
+
+git init
+
+git branch -M main
+
+git remote add origin https://github.com/mayu25601-jpg/Auto-Video-Factory.git
+
+git add .
+
+git commit -m "Fresh start from laptop with clean history"
+
+git push -f origin main
+
+######################################################################

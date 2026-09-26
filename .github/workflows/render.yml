@@ -1,0 +1,279 @@
+name: Video Renderer 20 Parallel
+
+on:
+  workflow_dispatch:
+    inputs:
+      format:
+        description: 'Video Format'
+        required: true
+        default: 'youtube'
+        type: choice
+        options:
+          - youtube
+          - shorts
+          - facebook
+      branding:
+        description: 'Channel Branding'
+        required: true
+        default: 'BRAND_A'
+        type: choice
+        options:
+          - BRAND_A
+          - BRAND_B
+          - none
+      fps:
+        description: 'FPS (24=quality / 20=faster)'
+        required: true
+        default: '24'
+        type: choice
+        options:
+          - '24'
+          - '20'
+      quality:
+        description: 'JPEG Quality (85=default / 75=faster)'
+        required: true
+        default: '85'
+        type: choice
+        options:
+          - '85'
+          - '75'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  render-video:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        folder: ['1','2','3','4','5','6','7','8','9','10',
+                 '11','12','13','14','15','16','17','18','19','20']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check folder exists
+        id: check
+        run: |
+          FOLDER="videos/${{ matrix.folder }}"
+          if [ ! -d "$FOLDER" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          has_mp3=$(find "$FOLDER" -maxdepth 1 -iname "*.mp3" 2>/dev/null | wc -l)
+          has_img=$(find "$FOLDER" -maxdepth 1 \
+            \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) \
+            2>/dev/null | wc -l)
+          if [[ $has_mp3 -eq 0 || $has_img -eq 0 ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Python
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-v5
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Cache Whisper model
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/whisper
+          key: whisper-small-v1
+
+      - name: Cache Playwright browsers
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-v1
+
+      - name: Install Python packages
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          pip install --upgrade pip
+          pip install \
+            "numpy<2.0.0" \
+            "moviepy==1.0.3" \
+            Pillow \
+            openai-whisper \
+            playwright
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Playwright and Chromium
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Install FFmpeg and Fonts
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            ffmpeg fonts-noto-core fonts-noto-color-emoji \
+            fonts-sil-padauk fonts-liberation fontconfig
+          fc-cache -f
+
+      - name: Render Folder ${{ matrix.folder }}
+        if: steps.check.outputs.skip != 'true'
+        id: render
+        env:
+          FOLDER_NAME:          ${{ matrix.folder }}
+          VIDEO_FORMAT:         ${{ github.event.inputs.format }}
+          BRANDING_ALIAS:       ${{ github.event.inputs.branding }}
+          FPS_INPUT:            ${{ github.event.inputs.fps }}
+          QUALITY_INPUT:        ${{ github.event.inputs.quality }}
+          SECRET_BRAND_A:       ${{ secrets.MY_BRAND_A }}
+          SECRET_BRAND_A_TYPOS: ${{ secrets.MY_BRAND_A_TYPOS }}
+          SECRET_BRAND_B:       ${{ secrets.MY_BRAND_B }}
+          SECRET_BRAND_B_TYPOS: ${{ secrets.MY_BRAND_B_TYPOS }}
+        run: |
+          for attempt in 1 2; do
+            echo "Attempt ${attempt}/2"
+            if python scripts/render_single.py; then
+              echo "render_status=success" >> $GITHUB_OUTPUT
+              break
+            else
+              if [ $attempt -eq 2 ]; then
+                echo "render_status=failed" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+
+      - name: Upload Video_${{ matrix.folder }}
+        if: >
+          steps.check.outputs.skip != 'true' &&
+          steps.render.outputs.render_status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Video_${{ matrix.folder }}
+          path: output/${{ matrix.folder }}.mp4
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+
+  send-as-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pyrogram
+        run: pip install pyrogram tgcrypto -q
+
+      - name: Send each video as soon as it is ready
+        env:
+          GH_TOKEN:            ${{ github.token }}
+          GITHUB_TOKEN:        ${{ github.token }}
+          GITHUB_RUN_ID:       ${{ github.run_id }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
+          TELEGRAM_API_ID:     ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH:   ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION:    ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORMAT:              ${{ github.event.inputs.format }}
+          BRANDING:            ${{ github.event.inputs.branding }}
+        run: python scripts/send_as_ready.py
+
+  collect-results:
+    needs: [render-video, send-as-ready]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pyrogram
+        run: pip install pyrogram tgcrypto -q
+
+      - name: Final Telegram Summary
+        continue-on-error: true
+        env:
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORMAT:            ${{ github.event.inputs.format }}
+          BRANDING:          ${{ github.event.inputs.branding }}
+          FPS:               ${{ github.event.inputs.fps }}
+          RUN_ID:            ${{ github.run_id }}
+          REPO:              ${{ github.repository }}
+          RENDER:            ${{ needs.render-video.result }}
+          SEND:              ${{ needs.send-as-ready.result }}
+        run: |
+          python - << 'PYEOF'
+          import os, asyncio, sys
+          from pyrogram import Client
+
+          API_ID   = os.environ.get("TELEGRAM_API_ID", "")
+          API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+          SESSION  = os.environ.get("TELEGRAM_SESSION", "")
+          CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not all([API_ID, API_HASH, SESSION, CHAT_ID]):
+              print("Missing secrets — skip")
+              sys.exit(0)
+
+          RUN_URL = f"https://github.com/{os.environ['REPO']}/actions/runs/{os.environ['RUN_ID']}"
+          msg = (
+              f"RENDER {os.environ.get('RENDER')}\n"
+              f"SEND   {os.environ.get('SEND')}\n"
+              f"Format : {os.environ.get('FORMAT')}\n"
+              f"Brand  : {os.environ.get('BRANDING')}\n"
+              f"{RUN_URL}"
+          )
+
+          async def send():
+              try:
+                  chat = int(CHAT_ID)
+              except ValueError:
+                  chat = CHAT_ID
+              app = Client(
+                  name="yt_final",
+                  session_string=SESSION,
+                  api_id=int(API_ID),
+                  api_hash=API_HASH,
+                  no_updates=True,
+              )
+              async with app:
+                  await app.send_message(chat_id=chat, text=msg)
+
+          try:
+              asyncio.run(send())
+          except Exception as e:
+              print(f"Summary error: {e}")
+          PYEOF

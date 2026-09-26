@@ -1,0 +1,7 @@
+output/
+*.mp4
+*.temp
+
+*.session
+get_session.py
+get_session.txt
